@@ -66,15 +66,22 @@
 
 ## 🚀 极速部署
 
+### 方式零：一键脚本全自动部署（含 Muse 视频工作台网页 + Docker 接口服务）
+
+```bash
+curl -fsSL -o install.sh https://raw.githubusercontent.com/keqin3/muse2api/main/install.sh
+sudo bash install.sh
+```
+
+---
+
 ### 方式一：Docker Compose（推荐，一行命令开箱即用）
 
 1. **克隆代码并进入目录**：
    ```bash
-   git clone https://github.com/yys9253462-gif/muse2api.git
+   git clone https://github.com/keqin3/muse2api.git
    cd muse2api
    ```
-   > 想用上游官方版本，把地址换成 `https://github.com/czg86389-hub/muse2api.git` 即可
-   > （但会缺少本分支的 11 项修复）。
 
 2. **配置环境变量（可选）**：
    ```bash

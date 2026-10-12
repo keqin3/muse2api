@@ -92,7 +92,18 @@ class MuseEngine:
                     pass
 
         os.makedirs(self.cfg.data_dir, exist_ok=True)
-        self._log = open(os.path.join(self.cfg.data_dir, "chromium.log"), "ab", buffering=0)
+        log_path = os.path.join(self.cfg.data_dir, "chromium.log")
+        try:
+            if os.path.isfile(log_path) and os.path.getsize(log_path) > 50 * 1024 * 1024:
+                os.replace(log_path, log_path + ".old")
+        except OSError:
+            pass
+        if self._log:
+            try:
+                self._log.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self._log = open(log_path, "ab", buffering=0)
         cwd_dir = self.cfg.home_dir if (self.cfg.home_dir and os.path.isdir(self.cfg.home_dir)) else None
         self.proc = subprocess.Popen(args, stdout=self._log, stderr=subprocess.STDOUT,
                                      env=env, cwd=cwd_dir)
@@ -104,7 +115,7 @@ class MuseEngine:
                 return
             except Exception as exc:  # noqa: BLE001
                 last = exc
-                time.sleep(1)
+                time.sleep(0.4)
         raise MuseGenerationError(f"Chromium 启动失败: {last}")
 
     def stop(self):
@@ -119,6 +130,12 @@ class MuseEngine:
             except Exception:  # noqa: BLE001
                 self.proc.kill()
         self.proc = None
+        if self._log:
+            try:
+                self._log.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._log = None
 
     # ---------------- 页面 ----------------
     def _open_page(self):
@@ -210,12 +227,13 @@ class MuseEngine:
         }
 
     def _apply_cookies(self, page: CDP, cookies: dict, expires: dict | None = None):
-        """注入 cookie。彻底清空旧账号 cookie 保证隔离，且绝不传入过去时间的 expires 防止 Chromium 丢弃 hatch_vml。"""
+        """注入 cookie。彻底清空旧账号 cookie 保证隔离，且优先使用 Network.setCookies 批量单次注入以消除 30+ 次同步 CDP 往返。"""
         try:
             page.send("Network.clearBrowserCookies")
         except Exception:
             pass
         now = time.time()
+        batch = []
         for name, value in cookies.items():
             if not value:
                 continue
@@ -225,14 +243,21 @@ class MuseEngine:
             except (TypeError, ValueError):
                 exp_val = now + 7 * 86400
             for dom in (".muse.ai", "muse.ai"):
-                params = {
+                batch.append({
                     "name": name,
                     "value": value,
                     "domain": dom,
                     "path": "/",
                     "secure": True,
                     "expires": exp_val,
-                }
+                })
+        if not batch:
+            return
+        try:
+            page.send("Network.setCookies", {"cookies": batch})
+            return
+        except Exception:  # noqa: BLE001
+            for params in batch:
                 try:
                     page.send("Network.setCookie", params)
                 except Exception:  # noqa: BLE001
@@ -582,7 +607,7 @@ class MuseEngine:
             })()""")
         except Exception:
             pass
-        time.sleep(0.1)
+        time.sleep(0.04)
 
         rect = self.page.js(
             "(function(){var t=document.querySelector('textarea');if(!t)return null;"
@@ -596,7 +621,7 @@ class MuseEngine:
             self.page.send("Input.dispatchMouseEvent",
                            {"type": t, "x": c["x"], "y": c["y"],
                             "button": "left", "clickCount": 1})
-        time.sleep(0.1)
+        time.sleep(0.04)
 
         # 触发 React 18 原型 setter 以及 input/change 事件以同步发送按钮状态
         # （对于 DeepSeek/Codex 等 100KB+ 超长上下文，直接走原型 setter 仅需 <1s，避免 Input.insertText 逐字注入卡死）
@@ -659,19 +684,19 @@ class MuseEngine:
         return atts[-1] if atts else None
 
     def _scroll_bottom(self):
-        """滚到聊天底部。muse.ai 的聊天滚动容器是内层 div（不是 document），
-        虚拟列表按滚动位置渲染节点 —— 不滚到底，新消息根本不在 DOM 里。"""
+        """滚到聊天底部。优先复用缓存的滚动容器，避免每次轮询对全页 DOM 调用 getComputedStyle。"""
         try:
             self.page.js(
                 "(function(){"
-                "var els=[...document.querySelectorAll('*')].filter(function(e){"
-                "var s=getComputedStyle(e);"
-                "return (s.overflowY==='auto'||s.overflowY==='scroll')"
-                "&&e.scrollHeight>e.clientHeight+100;});"
+                "var sc=window.__m2a_scroller;"
+                "if(!sc||!sc.isConnected||sc.scrollHeight<=sc.clientHeight){"
+                "var els=[...document.querySelectorAll('main,[class*=\"chat-scroll\"],[class*=\"hatch-chat-scroll\"],div[class*=\"overflow-y-auto\"]')].filter(function(e){return e.scrollHeight>e.clientHeight+80;});"
+                "if(!els.length){els=[...document.querySelectorAll('div')].filter(function(e){var s=getComputedStyle(e);return (s.overflowY==='auto'||s.overflowY==='scroll')&&e.scrollHeight>e.clientHeight+100;});}"
                 "els.sort(function(a,b){return b.scrollHeight-a.scrollHeight;});"
-                "if(els[0])els[0].scrollTop=els[0].scrollHeight;"
+                "sc=els[0]||null;window.__m2a_scroller=sc;}"
+                "if(sc)sc.scrollTop=sc.scrollHeight;"
                 "var s=document.scrollingElement||document.body;"
-                "s.scrollTop=s.scrollHeight;"
+                "if(s)s.scrollTop=s.scrollHeight;"
                 "var el=document.querySelector('textarea');"
                 "if(el)el.scrollIntoView({block:'end'});return 1;})()")
         except Exception:  # noqa: BLE001
@@ -685,6 +710,7 @@ class MuseEngine:
         t_start = time.time()
         stable_src, stable_n = "", 0
         last_txt, txt_stable = "", 0
+        last_prog = -1
         while time.time() < deadline:
             if stop_event is not None and stop_event.is_set():
                 raise MuseGenerationError("客户端已断开连接，终止生成任务")
@@ -718,10 +744,12 @@ class MuseEngine:
                 # 渐进逼近 95 而非在 92 处饱和：避免「任务明明还在跑、
                 # 进度却纹丝不动」被误判成卡死（长视频实测会跑 5~10 分钟）。
                 prog = min(95, int(25 + elapsed * 0.6))
-                try:
-                    on_progress(prog)
-                except Exception:
-                    pass
+                if prog != last_prog:
+                    last_prog = prog
+                    try:
+                        on_progress(prog)
+                    except Exception:
+                        pass
             try:
                 st_raw = self.page.js("""(function(){
                     var bs=[].slice.call(document.querySelectorAll('div[class*="hatch-chat-groupable-bubble"]'))
@@ -820,11 +848,13 @@ class MuseEngine:
     # 同时返回真实计数（仅含非空气泡），避免骨架气泡污染 cnt 判定。
     _POLL_CHAT_JS = (
         "(function(){"
-        "var els=[...document.querySelectorAll('*')].filter(function(e){"
-        "var s=getComputedStyle(e);"
-        "return (s.overflowY==='auto'||s.overflowY==='scroll')&&e.scrollHeight>e.clientHeight+100;});"
+        "var sc=window.__m2a_scroller;"
+        "if(!sc||!sc.isConnected||sc.scrollHeight<=sc.clientHeight){"
+        "var els=[...document.querySelectorAll('main,[class*=\"chat-scroll\"],[class*=\"hatch-chat-scroll\"],div[class*=\"overflow-y-auto\"]')].filter(function(e){return e.scrollHeight>e.clientHeight+80;});"
+        "if(!els.length){els=[...document.querySelectorAll('div')].filter(function(e){var s=getComputedStyle(e);return (s.overflowY==='auto'||s.overflowY==='scroll')&&e.scrollHeight>e.clientHeight+100;});}"
         "els.sort(function(a,b){return b.scrollHeight-a.scrollHeight;});"
-        "if(els[0])els[0].scrollTop=els[0].scrollHeight;"
+        "sc=els[0]||null;window.__m2a_scroller=sc;}"
+        "if(sc)sc.scrollTop=sc.scrollHeight;"
         "var all=[].slice.call(document.querySelectorAll('div[class*=\"hatch-chat-groupable-bubble\"]'))"
         ".filter(function(b){return /hatch-agent-bubble-bg/.test(b.className||'');});"
         "var nonEmpty=all.filter(function(b){return ((b.innerText||'').trim().length)>0;});"

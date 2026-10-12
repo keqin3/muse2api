@@ -103,6 +103,7 @@ class Store:
             if _is_pos(ce.get("hatch_vml")):
                 a["expires_at"] = int(ce["hatch_vml"])
         self.tasks: dict[str, dict] = _read(cfg.tasks_file, {})
+        self._task_sync_ts: dict[str, float] = {}
 
     # ---------- 账号 ----------
     def add_account(self, cookies: dict, label: str = "",
@@ -255,13 +256,26 @@ class Store:
                 "expiring": expiring, "expired": expired}
 
     # ---------- 任务 ----------
-    def create_task(self, kind: str, prompt: str) -> dict:
+    def create_task(self, kind: str, prompt: str, **extra) -> dict:
         with _LOCK:
+            now = int(time.time())
+            if len(self.tasks) >= 500:
+                terminal = sorted(
+                    (x for x in self.tasks.values()
+                     if x.get("status") in ("completed", "failed", "timeout")),
+                    key=lambda x: x.get("created_at") or 0,
+                )
+                for old in terminal[: max(0, len(self.tasks) - 400)]:
+                    self.tasks.pop(old["id"], None)
+                    self._task_sync_ts.pop(old["id"], None)
             tid = "task_" + uuid.uuid4().hex[:20]
             t = {"id": tid, "object": "task", "kind": kind, "prompt": prompt,
-                 "status": "queued", "created_at": int(time.time()),
-                 "updated_at": int(time.time()), "result": None, "error": None}
+                 "status": "queued", "created_at": now,
+                 "updated_at": now, "result": None, "error": None}
+            if extra:
+                t.update(extra)
             self.tasks[tid] = t
+            self._task_sync_ts[tid] = time.time()
             _write(self.cfg.tasks_file, self.tasks)
             return t
 
@@ -270,9 +284,13 @@ class Store:
             t = self.tasks.get(tid)
             if not t:
                 return None
+            now_f = time.time()
+            is_progress_only = set(kw.keys()) <= {"progress", "stage"}
             t.update(kw)
-            t["updated_at"] = int(time.time())
-            _write(self.cfg.tasks_file, self.tasks)
+            t["updated_at"] = int(now_f)
+            if not is_progress_only or (now_f - self._task_sync_ts.get(tid, 0.0) >= 8.0):
+                self._task_sync_ts[tid] = now_f
+                _write(self.cfg.tasks_file, self.tasks)
             return t
 
     def get_task(self, tid: str) -> dict | None:

@@ -174,6 +174,8 @@ class Scheduler:
         queue.Full : 队列已满。
         """
         qto = int(queue_timeout if queue_timeout is not None else self.queue_timeout)
+        if not self._worker or not self._worker.is_alive():
+            self.start()
         with self._seq_lock:
             self._seq += 1
             seq = self._seq

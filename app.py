@@ -58,7 +58,7 @@ if not log.handlers:
     log.addHandler(_h)
 
 CFG.ensure_dirs()
-app = FastAPI(title="muse2api", version="1.5.3")
+app = FastAPI(title="muse2api", version="1.5.4")
 
 # Cookie 助手脚本从 muse.ai 页面发起导入请求，需要放行该来源；
 # 浏览器扩展从 chrome-extension:// 发起，也一并放行。
@@ -156,7 +156,7 @@ async def _validation_exc(request: Request, exc: RequestValidationError):
 async def _guard_method_not_allowed(request: Request, call_next):
     response = await call_next(request)
     if (response.status_code == 405
-            and request.url.path.startswith("/v1/")):
+            and request.url.path.startswith(("/v1/", "/admin/"))):
         auth_err = _check_bearer(request.headers.get("authorization"))
         if auth_err is not None:
             return JSONResponse(
@@ -380,7 +380,7 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
 #     base64 乱码）时，`_normalize_image` 失败后**静默返回空**，任务照样往下跑，
 #     白等 1.5~3 倍时间才失败（实测 194.7s）。
 # 这里统一做「入口即校验」，把非法输入在提交阶段就打回去。
-_VIDEO_DURATIONS = {5, 6, 10}          # muse.ai 网页实际可选的时长档位
+_VIDEO_DURATIONS = {5, 6, 8, 10}       # muse.ai 网页实际可选的时长档位
 _VALID_IMAGE_MIME = {"image/png", "image/jpeg", "image/jpg", "image/webp",
                      "image/gif", "image/bmp"}
 _MAX_REF_BYTES = 20 * 1024 * 1024      # 参考图上限 20MB
@@ -786,6 +786,17 @@ def build_video_prompt(r: VideoRequest) -> str:
             parts.append(f"基于我本次上传的参考图片附件作为第一帧参考图（严禁使用历史图片或任何其他图像，必须严格以我当前刚刚上传并附带在此处的这张图片为起始帧）：生成一个16:9宽屏横屏图生视频（16:9 widescreen landscape video，严格以附带的参考图为起始第一帧延续动作，时长严格为 {dur} 秒）：{user_prompt}")
         else:
             parts.append(f"全新文生视频创作（纯文本全新生成，严禁参考任何历史图片或上下文）：生成一个16:9横屏宽屏视频（16:9 widescreen landscape video，时长严格为 {dur} 秒）：{user_prompt}")
+    elif any(k in ar or k in sz for k in ("1:1", "square", "正方形", "1024x1024")):
+        if has_ref:
+            parts.append(f"基于我本次上传的参考图片附件作为第一帧参考图（严禁使用历史图片或任何其他图像，必须严格以我当前刚刚上传并附带在此处的这张图片为起始帧）：生成一个1:1正方形画幅图生视频（1:1 square aspect ratio video，严格以附带的参考图为起始第一帧延续动作，时长严格为 {dur} 秒）：{user_prompt}")
+        else:
+            parts.append(f"全新文生视频创作（纯文本全新生成，严禁参考任何历史图片或上下文）：生成一个1:1正方形画幅视频（1:1 square aspect ratio video，时长严格为 {dur} 秒）：{user_prompt}")
+    elif any(k in ar or k in sz for k in ("4:3", "4/3", "3:4", "3/4")):
+        ratio_lbl = "3:4" if ("3:4" in ar or "3/4" in ar or "3:4" in sz or "3/4" in sz) else "4:3"
+        if has_ref:
+            parts.append(f"基于我本次上传的参考图片附件作为第一帧参考图（严禁使用历史图片或任何其他图像，必须严格以我当前刚刚上传并附带在此处的这张图片为起始帧）：生成一个 {ratio_lbl} 画幅图生视频（{ratio_lbl} aspect ratio video，严格以附带的参考图为起始第一帧延续动作，时长严格为 {dur} 秒）：{user_prompt}")
+        else:
+            parts.append(f"全新文生视频创作（纯文本全新生成，严禁参考任何历史图片或上下文）：生成一个 {ratio_lbl} 画幅视频（{ratio_lbl} aspect ratio video，时长严格为 {dur} 秒）：{user_prompt}")
     else:
         if has_ref:
             parts.append(f"基于我本次上传的参考图片附件作为第一帧参考图（严禁使用历史图片或任何其他图像，必须严格以我当前刚刚上传并附带在此处的这张图片为起始帧）：生成动态图生视频（严格以附带的参考图为起始第一帧延续动作，时长严格为 {dur} 秒）：{user_prompt}")
@@ -901,16 +912,25 @@ def _pos(v) -> bool:
 def _run_generation(prompt: str, kind: str, timeout: int,
                     account_id: str | None = None, on_progress=None,
                     reference_image: str | None = None) -> tuple[dict, str | None]:
-    # 锁契约（重要）：本函数假定调用方已持有 GEN_LOCK，自身不再抢锁。
-    # 正确调用方式是经由 `_sched_run(...)` / `SCHED.submit(...)` 提交成 job，
-    # 由调度器 worker 在持锁状态下调用。若直接在线程里裸调，
-    # 会与其它生成任务并发争抢同一个浏览器，导致串话。
-    #
-    # 上游原先在此处 `GEN_LOCK.acquire(timeout=...)`；因 GEN_LOCK 不可重入，
-    # 调度器 worker 已持锁后再抢会永久自锁，故抢锁职责上移至调度器。
-    deadline = time.monotonic() + max(1, timeout)
-    return _run_generation_locked(prompt, kind, timeout, account_id,
-                                  on_progress, reference_image, deadline=deadline)
+    # 锁契约：经由 SCHED 排队执行时，worker 线程已持有 GEN_LOCK，直接进入以避免不可重入锁死锁；
+    # 若由外部/测试直接调用（未处于 SCHED worker 持锁上下文中），则按 wait_timeout 获取并释放 GEN_LOCK。
+    wait_timeout = max(1, timeout)
+    deadline = time.monotonic() + wait_timeout
+    already_held = (
+        SCHED._worker is not None
+        and threading.current_thread() is SCHED._worker
+        and getattr(GEN_LOCK, "locked", lambda: False)()
+    )
+    if already_held:
+        return _run_generation_locked(prompt, kind, timeout, account_id,
+                                      on_progress, reference_image, deadline=deadline)
+    if not GEN_LOCK.acquire(timeout=wait_timeout):
+        raise MuseGenerationError("浏览器正忙，排队等待超时")
+    try:
+        return _run_generation_locked(prompt, kind, timeout, account_id,
+                                      on_progress, reference_image, deadline=deadline)
+    finally:
+        GEN_LOCK.release()
 
 
 def _run_generation_locked(prompt: str, kind: str, timeout: int,
@@ -1025,11 +1045,13 @@ def _queue_image(req: ImageRequest, prompt: str, reference_image: str | None,
         if sum(t.get("kind") == "image" and t.get("status") in ("queued", "processing")
                for t in tasks) >= 8:
             raise HTTPException(429, "Image queue is full; retry later")
-        task = store.create_task("image", req.prompt)
+        task = store.create_task(
+            "image", req.prompt,
+            api_prompt=prompt, size=req.size,
+            response_format=req.response_format, progress=0,
+            image_request_key=key_hash, image_request_hash=request_hash,
+        )
         tid = task["id"]
-        store.update_task(tid, api_prompt=prompt, size=req.size,
-                          response_format=req.response_format, progress=0,
-                          image_request_key=key_hash, image_request_hash=request_hash)
 
     def worker():
         # 经 FIFO 调度器排队执行（与 chat/video 共用一条队列，单 worker 持锁）。
@@ -1264,9 +1286,10 @@ async def create_video(req: VideoRequest, _=Depends(auth)):
 
     prompt = build_video_prompt(req)
     timeout = req.timeout or CFG.video_timeout
-    task = store.create_task("video", req.prompt)
-    store.update_task(task["id"], api_prompt=prompt,
-                      status=ST_QUEUED, progress=0, stage="queued")
+    task = store.create_task(
+        "video", req.prompt,
+        api_prompt=prompt, status=ST_QUEUED, progress=0, stage="queued",
+    )
 
     def job():
         """由调度器 worker 在持锁状态下执行。"""
@@ -2161,12 +2184,13 @@ def get_keepalive_status(_=Depends(auth)):
 
 
 # ------------------------- 仓库实时更新检测、通知与一键在线升级 -------------------------
-REPO_URL = "https://github.com/czg86389-hub/muse2api"
+REPO_SLUG = os.environ.get("MUSE2API_REPO", "keqin3/muse2api").strip() or "keqin3/muse2api"
+REPO_URL = f"https://github.com/{REPO_SLUG}"
 TRACKED_REPO_PATHS = [
-    "app.py", "engine.py", "store.py", "cdp.py", "config.py",
-    "admin.html", "README.md", "version.json", "requirements.txt",
+    "app.py", "engine.py", "store.py", "cdp.py", "config.py", "scheduler.py",
+    "admin.html", "README.md", "version.json", "requirements.txt", "install.sh",
     "Dockerfile", "docker-compose.yml", ".env.example", ".gitignore",
-    "LICENSE", "extension", "deploy", "tools",
+    "LICENSE", "extension", "deploy", "tools", "tests",
 ]
 _UPDATE_CACHE: dict[str, Any] = {"ts": 0.0, "data": None}
 
@@ -2218,9 +2242,9 @@ def _git(args: list[str], timeout: int = 30):
 
 
 def _ensure_git_repo(token: str = ""):
-    """确保 BASE_DIR 已初始化为绑定 czg86389-hub/muse2api 的 Git 仓库。"""
+    """确保 BASE_DIR 已初始化为绑定 keqin3/muse2api 的 Git 仓库。"""
     git_dir = os.path.join(BASE_DIR, ".git")
-    remote_url = f"https://x-access-token:{token}@github.com/czg86389-hub/muse2api.git" if token else f"{REPO_URL}.git"
+    remote_url = f"https://x-access-token:{token}@github.com/{REPO_SLUG}.git" if token else f"{REPO_URL}.git"
     if not os.path.isdir(git_dir):
         _git(["init", "-b", "main"])
         _git(["remote", "add", "origin", remote_url])
@@ -2228,12 +2252,13 @@ def _ensure_git_repo(token: str = ""):
         _git(["reset", "--mixed", "origin/main"])
     else:
         _git(["remote", "set-url", "origin", remote_url])
-    _git(["config", "user.name", "czg86389-hub"])
-    _git(["config", "user.email", "czg86389-hub@users.noreply.github.com"])
+    owner = REPO_SLUG.split("/", 1)[0]
+    _git(["config", "user.name", owner])
+    _git(["config", "user.email", f"{owner}@users.noreply.github.com"])
 
 
 def _check_update_sync(force: bool = False) -> dict:
-    """检测 GitHub 官方仓库 (czg86389-hub/muse2api) 是否有新版本或新提交。
+    """检测 GitHub 仓库是否有新版本或新提交。
     默认缓存 90 秒，防止频繁刷新触发 GitHub API 速率限制。"""
     now = time.time()
     if not force and _UPDATE_CACHE["data"] and (now - _UPDATE_CACHE["ts"]) < 90:
@@ -2270,7 +2295,7 @@ def _check_update_sync(force: bool = False) -> dict:
     highlights = list(local_ver_obj.get("highlights") or [])
     try:
         rv = requests.get(
-            f"https://raw.githubusercontent.com/czg86389-hub/muse2api/main/version.json?t={int(now)}",
+            f"https://raw.githubusercontent.com/{REPO_SLUG}/main/version.json?t={int(now)}",
             timeout=6,
         )
         if rv.status_code == 200:
@@ -2289,7 +2314,7 @@ def _check_update_sync(force: bool = False) -> dict:
         if token:
             headers["Authorization"] = f"Bearer {token}"
         resp = requests.get(
-            "https://api.github.com/repos/czg86389-hub/muse2api/commits?sha=main&per_page=5",
+            f"https://api.github.com/repos/{REPO_SLUG}/commits?sha=main&per_page=5",
             headers=headers,
             timeout=6,
         )
@@ -2369,7 +2394,7 @@ def _upgrade_from_github_sync() -> dict:
 
     if not upgraded_via:
         resp = requests.get(
-            "https://codeload.github.com/czg86389-hub/muse2api/tar.gz/refs/heads/main",
+            f"https://codeload.github.com/{REPO_SLUG}/tar.gz/refs/heads/main",
             timeout=60,
         )
         if resp.status_code != 200:
@@ -2415,8 +2440,8 @@ def _upgrade_from_github_sync() -> dict:
 
 @app.get("/admin/update/check")
 @app.get("/admin/repo/status")
-async def admin_check_update(force: bool = False):
-    """供所有已部署节点实时检测 GitHub 官方仓库是否有新版本更新。"""
+async def admin_check_update(force: bool = False, _=Depends(auth)):
+    """供所有已部署节点实时检测 GitHub 仓库是否有新版本更新。"""
     return await asyncio.to_thread(_check_update_sync, force)
 
 
@@ -2478,8 +2503,9 @@ async def admin_repo_push(payload: dict = Body(default={}), _=Depends(auth)):
 @app.on_event("startup")
 async def _startup():
     for task in list(store.tasks.values()):
-        if task.get("kind") == "image" and task.get("status") in ("queued", "processing"):
-            store.update_task(task["id"], status="failed", error="服务重启中断了任务，请重新提交")
+        if task.get("status") in ("queued", "processing"):
+            store.update_task(task["id"], status="failed", stage="failed",
+                              error="服务重启中断了任务，请重新提交")
     if not CFG.api_key:
         import secrets
         new_key = "m2a_" + secrets.token_hex(24)
